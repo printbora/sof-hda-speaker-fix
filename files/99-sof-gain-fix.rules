@@ -1,0 +1,3 @@
+# Re-apply the SOF DSP gains whenever a sound card's control device appears
+# (runs after 90-alsa-restore.rules, so a stale saved state cannot mute the speakers again).
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="controlC*", KERNELS!="card*", RUN+="/usr/local/sbin/sof-gain-fix apply"

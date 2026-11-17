@@ -1,0 +1,4 @@
+#!/bin/sh
+# systemd-sleep hook: re-apply the SOF DSP gains after resume.
+[ "$1" = post ] && ( sleep 2; /usr/local/sbin/sof-gain-fix apply >/dev/null 2>&1 ) &
+exit 0

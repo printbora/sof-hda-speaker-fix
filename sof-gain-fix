@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# sof-gain-fix - raise the internal SOF DSP playback gains from -90 dB to 0 dB.
+#
+# On Intel SOF laptops that use the generic HDA topology (sof-hda-generic*.tplg),
+# the DSP mixer gains "Pre/Post Mixer Analog Playback Volume" start at 0 (= -90 dB,
+# effectively silent). Newer alsa-ucm-conf profiles set them; older ones (e.g.
+# Ubuntu 22.04, 1.2.6.x) do not, so the internal speakers stay silent even though
+# the card, codec and PCM stream all look healthy.
+#
+# Usage:
+#   sof-gain-fix status          show SOF cards and the gain controls (read-only)
+#   sof-gain-fix apply [-n]      set the gains to 0 dB (-n / --dry-run: only print)
+#
+# Config: /etc/default/sof-gain-fix  (optional)
+#   CONTROLS="name1;name2;..."   override the list of controls to set
+#   TARGET_DB=0                  target gain in dB (never above 0 dB)
+set -u
+
+export LC_ALL=C
+VERSION="1.0.0"
+CONFIG="/etc/default/sof-gain-fix"
+CONTROLS="Pre Mixer Analog Playback Volume;Post Mixer Analog Playback Volume;Pre Mixer Deepbuffer HDA Analog Volume"
+TARGET_DB=0
+# shellcheck disable=SC1090
+[ -r "$CONFIG" ] && . "$CONFIG"
+
+log() { printf '%s\n' "$*"; }
+command -v amixer >/dev/null 2>&1 || { log "sof-gain-fix: amixer not found (install alsa-utils)"; exit 1; }
+
+# Card numbers whose kernel driver is an SOF machine driver.
+sof_cards() {
+    local d n drv
+    for d in /sys/class/sound/card[0-9]*; do
+        [ -e "$d" ] || continue
+        n=${d##*card}
+        drv=$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)" 2>/dev/null)
+        if [[ "$drv" == *sof* || "$drv" == *hda_dsp* ]] || grep -qi 'sof' "/proc/asound/card$n/id" 2>/dev/null; then
+            echo "$n"
+        fi
+    done
+}
+
+# Print "value max dbmin dbstep" for a control, or nothing if it does not exist.
+ctl_info() {
+    amixer -c "$1" cget name="$2" 2>/dev/null | awk '
+        /type=INTEGER/ { if (match($0, /max=-?[0-9]+/)) max = substr($0, RSTART+4, RLENGTH-4) }
+        /: values=/    { split($0, a, "values="); split(a[2], v, ","); val = v[1] }
+        /dBscale-min=/ { if (match($0, /dBscale-min=-?[0-9.]+/)) dmin = substr($0, RSTART+12, RLENGTH-12)
+                         if (match($0, /step=-?[0-9.]+/))        dstep = substr($0, RSTART+5, RLENGTH-5) }
+        END { if (val != "") printf "%s %s %s %s\n", val, max, (dmin == "" ? "x" : dmin), (dstep == "" ? "x" : dstep) }'
+}
+
+# Raw value that corresponds to TARGET_DB (clamped to [0, max]).
+target_raw() { # $1=max $2=dbmin $3=dbstep
+    awk -v max="$1" -v dmin="$2" -v dstep="$3" -v t="$TARGET_DB" 'BEGIN {
+        if (t > 0) t = 0
+        if (dmin == "x" || dstep == "x" || dstep == 0) { print max; exit }
+        r = int((t - dmin) / dstep + 0.5); if (r > max) r = max; if (r < 0) r = 0; print r }'
+}
+
+to_db() { awk -v r="$1" -v dmin="$2" -v dstep="$3" 'BEGIN { if (dmin == "x") print "?"; else printf "%.1f dB", dmin + r * dstep }'; }
+
+run() { # $1 = dry-run flag (0/1)
+    local dry="$1" cards card ctl info val max dmin dstep want changed=0 found=0
+    cards=$(sof_cards)
+    if [ -z "$cards" ]; then
+        log "sof-gain-fix: no SOF sound card found - nothing to do."
+        return 0
+    fi
+    IFS=';' read -r -a list <<< "$CONTROLS"
+    for card in $cards; do
+        log "card $card ($(cat "/proc/asound/card$card/id" 2>/dev/null)):"
+        for ctl in "${list[@]}"; do
+            [ -z "$ctl" ] && continue
+            info=$(ctl_info "$card" "$ctl")
+            [ -z "$info" ] && continue
+            found=1
+            read -r val max dmin dstep <<< "$info"
+            want=$(target_raw "$max" "$dmin" "$dstep")
+            if [ "$val" = "$want" ]; then
+                log "  ok       '$ctl' = $val ($(to_db "$val" "$dmin" "$dstep"))"
+            elif [ "$dry" = 1 ]; then
+                log "  would set '$ctl' $val -> $want ($(to_db "$val" "$dmin" "$dstep") -> $(to_db "$want" "$dmin" "$dstep"))"
+            elif amixer -q -c "$card" cset name="$ctl" "$want,$want" 2>/dev/null || amixer -q -c "$card" cset name="$ctl" "$want" 2>/dev/null; then
+                log "  set      '$ctl' $val -> $want ($(to_db "$want" "$dmin" "$dstep"))"
+                changed=1
+            else
+                log "  FAILED   '$ctl' (run as root?)"
+            fi
+        done
+    done
+    [ "$found" = 0 ] && log "  (none of the known gain controls exist on this card - this fix probably does not apply)"
+    # Save the new levels so alsa-restore brings them back at the next boot as well.
+    if [ "$changed" = 1 ] && [ "$(id -u)" -eq 0 ] && command -v alsactl >/dev/null 2>&1; then
+        alsactl store >/dev/null 2>&1 && log "  saved with 'alsactl store'"
+    fi
+    return 0
+}
+
+status() {
+    log "sof-gain-fix $VERSION"
+    log "kernel: $(uname -r)"
+    local f
+    for f in /proc/asound/card[0-9]*/codec#*; do
+        [ -r "$f" ] || continue
+        log "codec:  ${f#/proc/asound/}  $(sed -n 's/^Codec: //p' "$f" | head -1)  $(grep -m1 'Subsystem Id' "$f")"
+    done
+    run 1
+}
+
+case "${1:-status}" in
+    status)          status ;;
+    apply)           case "${2:-}" in -n|--dry-run) run 1 ;; *) run 0 ;; esac ;;
+    -V|--version)    log "$VERSION" ;;
+    -h|--help|help)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)               log "usage: sof-gain-fix {status|apply [--dry-run]}"; exit 2 ;;
+esac

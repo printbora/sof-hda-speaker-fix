@@ -1,0 +1,5 @@
+# Configuration for /usr/local/sbin/sof-gain-fix
+# Semicolon-separated list of ALSA controls to raise (default list shown):
+#CONTROLS="Pre Mixer Analog Playback Volume;Post Mixer Analog Playback Volume;Pre Mixer Deepbuffer HDA Analog Volume"
+# Target gain in dB (0 = unity, the value the SOF topology is designed for; never set above 0):
+#TARGET_DB=0

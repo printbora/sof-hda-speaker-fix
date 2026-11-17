@@ -1,0 +1,15 @@
+[Unit]
+Description=Set SOF DSP playback gains to 0 dB (internal speaker fix)
+After=sound.target alsa-restore.service alsa-state.service
+Wants=sound.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The SOF card can appear a few seconds after sound.target; the udev rule covers
+# the normal case, this delayed pass is a safety net.
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/sbin/sof-gain-fix apply
+
+[Install]
+WantedBy=multi-user.target
